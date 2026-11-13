@@ -378,7 +378,8 @@ def count_lines(text: str, size: float, avail_pt: float, ea: str | None, latin: 
         tokens = re.findall(r" +|[!-~]+|[^!-~ ]", part.replace("\t", "    "))
         lines, cur = 1, 0.0
         for tok in tokens:
-            w_ = sum(char_width_em(ch, latin if ord(ch) < 128 else ea) for ch in tok) * size
+            # 한글·한자만 한글 글꼴, 나머지(·, 그리스 문자, 아래첨자 숫자 등)는 영문 글꼴 너비로
+            w_ = sum(char_width_em(ch, ea if is_cjk(ch) else latin) for ch in tok) * size
             if tok.startswith(" "):
                 cur += w_
                 continue
@@ -392,6 +393,49 @@ def count_lines(text: str, size: float, avail_pt: float, ea: str | None, latin: 
             cur += w_
         total_lines += lines
     return total_lines
+
+
+def count_lines_runs(segs, avail_pt: float) -> int:
+    """count_lines 와 같지만 글자 조각마다 자기 글꼴·크기로 너비를 잼.
+    segs: [(글자, 크기pt, 한글 글꼴, 영문 글꼴)]"""
+    import math
+    chars, widths = [], []
+    for text, size, ea, lat in segs:
+        for ch in (text or "").replace("\t", "    "):
+            chars.append(ch)
+            widths.append(0.0 if ch == "\n" else char_width_em(ch, ea if is_cjk(ch) else lat) * size)
+    total, lines, cur = 0, 1, 0.0
+    i, n = 0, len(chars)
+    while i < n:
+        ch = chars[i]
+        if ch == "\n":
+            total += lines
+            lines, cur = 1, 0.0
+            i += 1
+            continue
+        # 낱말 묶음: 영문·숫자 연속은 한 덩어리, 빈칸은 따로, 한글은 글자 단위
+        j = i + 1
+        if ch == " ":
+            while j < n and chars[j] == " ":
+                j += 1
+        elif "!" <= ch <= "~":
+            while j < n and "!" <= chars[j] <= "~":
+                j += 1
+        w_ = sum(widths[i:j])
+        if ch == " ":
+            cur += w_
+        else:
+            if cur + w_ > avail_pt and cur > 0:
+                lines += 1
+                cur = 0.0
+                if w_ > avail_pt:
+                    lines += math.ceil(w_ / avail_pt) - 1
+                    cur = w_ % avail_pt
+                    i = j
+                    continue
+            cur += w_
+        i = j
+    return total + lines
 
 
 def font_line_ratio(name: str | None) -> float:
@@ -1493,9 +1537,12 @@ class Converter:
                 img_h = sum(self.image_size(v[0], v[2], v[3], max_w)[1] for k, v, f in chunk if k == "image")
                 lat = next((f.font_latin for k, v, f in chunk if k == "text" and v.strip()), mark_fmt.font_latin)
                 ea = next((f.font_ea for k, v, f in chunk if k == "text" and v.strip()), mark_fmt.font_ea)
+                # 위/아래 첨자는 한글에서 작게 그려지므로 너비도 작게
+                segs = [(v, f.size * (0.6 if f.script else 1.0), f.font_ea, f.font_latin)
+                        for k, v, f in chunk if k == "text"]
                 self._est.append((text, main_size, self.line_percent(pf_c, main_size, fonts[0]),
                                   pf_c.before, pf_c.after, img_h, ea, lat,
-                                  (pf_c.left + max(pf_c.first_line, 0) + pf_c.right) / 20))
+                                  (pf_c.left + max(pf_c.first_line, 0) + pf_c.right) / 20, segs))
         return paragraphs
 
     def flow_before(self, pf: ParaFmt, style_id: str | None) -> int:
@@ -1510,16 +1557,47 @@ class Converter:
         p_para, p_pf, p_size, p_font, p_style = prev
         same = p_style == (style_id or self.pkg.default_para_style)
         before = pf.before
-        if same and p_pf.contextual and p_pf.after:
-            p_pf = replace(p_pf, after=0)
+
+        def set_prev_after(value):
+            nonlocal p_pf
+            p_pf = replace(p_pf, after=value)
             try:
                 p_para.para_pr_id_ref = self.para_pr(p_pf, p_size, p_font)
                 self._flow_prev = (p_para, p_pf, p_size, p_font, p_style)
             except Exception:
                 pass
+
+        if same and p_pf.contextual and p_pf.after:
+            set_prev_after(0)
         if same and pf.contextual:
             before = 0
+        # 문단 테두리(상자): 한글은 문단 위/아래 간격까지 테두리 안에 그리지만 Word 는 상자 밖에 둠
+        # → 상자와 바깥 문단 사이 간격은 상자 밖(바깥 문단 쪽)으로 옮김
+        box, p_box = self.box_key(pf), self.box_key(p_pf)
+        if box != p_box:
+            gap = max(before, p_pf.after, 0)
+            if p_box is not None:          # 상자 → 바깥(또는 다른 상자): 간격을 이 문단 위로
+                set_prev_after(0)
+                # Word 는 테두리 안쪽 여백·선 두께도 문단 높이에 넣지만 한글은 아래 문단 간격에 겹쳐 그림
+                return gap + self.border_pad(p_pf, "bottom")
+            set_prev_after(gap + self.border_pad(pf, "top"))   # 바깥 → 상자: 간격을 앞 문단 아래로
+            return 0
         return max(0, before - max(p_pf.after, 0))
+
+    @staticmethod
+    def border_pad(pf: ParaFmt, side: str) -> int:
+        """테두리 안쪽 여백 + 선 두께 (twips)"""
+        b = pf.borders.get(side)
+        if not b or not b[0]:
+            return 0
+        return int(pf.border_space.get(side, 0) * 20 + b[2] / 25.4 * 1440)
+
+    @staticmethod
+    def box_key(pf: ParaFmt):
+        active = tuple(sorted((s, b) for s, b in pf.borders.items() if b and b[0]))
+        if not active and not pf.fill:
+            return None
+        return active, pf.fill
 
     def add_equation(self, para, el, fmt) -> bool:
         """Word 수식 → 한글 수식(고칠 수 있는 수식 개체). 안 되면 글자로."""
@@ -1588,7 +1666,13 @@ class Converter:
             ea, lat, indent = (item[6], item[7], item[8]) if len(item) > 8 else (None, None, 0)
             # 실제 글꼴 너비로 한글의 줄 나눔을 흉내 냄
             # (한글은 파일에 저장된 행 높이를 그대로 쓰므로 줄 수가 정확해야 글자가 칸을 넘지 않음)
-            lines = count_lines(text, size, max(avail_pt - indent, 10) * 0.98, ea, lat) if size else 0
+            width = max(avail_pt - indent, 10) * 0.98
+            if not size:
+                lines = 0
+            elif len(item) > 9 and item[9]:
+                lines = count_lines_runs(item[9], width)
+            else:
+                lines = count_lines(text, size, width, ea, lat)
             h = lines * size * pct / 100 if size else 0
             if img_h:
                 h = max(h, img_h / 100 + size * 0.3)
@@ -1755,8 +1839,11 @@ class Converter:
             pos.set("horzAlign", {"center": "CENTER", "right": "RIGHT", "end": "RIGHT"}.get(jc, "LEFT"))
             pos.set("horzOffset", "0")
         table.element.set("textWrap", "TOP_AND_BOTTOM")
-        # 쪽 경계에서 "나눔"(행 단위): 행 하나가 두 쪽으로 쪼개지지 않고 통째로 다음 쪽으로 감 (Word 와 같은 모양)
-        table.element.set("pageBreak", "TABLE")
+        # 쪽 경계에서 나누기
+        # - 행에 "행을 나눠 다음 쪽으로 넘기지 않음"(cantSplit)이 있으면 행 단위로 (행이 통째로 다음 쪽으로)
+        # - 없으면 Word·한글처럼 행 중간에서도 나눔 (아니면 큰 행 앞에서 쪽 아래가 비어 버림)
+        cant_split = any(on_off(tr.find(f"{w('trPr')}/{w('cantSplit')}")) for tr in rows)
+        table.element.set("pageBreak", "TABLE" if cant_split else "CELL")
         # 머리글 행 반복
         header_rows = set()
         for r, tr in enumerate(rows):
