@@ -44,4 +44,13 @@ Word 문서(.docx)를 한글 문서(.hwp / .hwpx)로 바꿔 주는 Windows용 �
 - Word 와 한글의 글자 배치 계산이 달라서 줄이 바뀌는 위치·쪽 수가 조금 다를 수 있습니다.
 - 차트는 `[차트]` 표시로, SmartArt 는 글자만 옮겨집니다. 떠 있는 그림은 글 줄 안에 놓입니다.
 
-변환에는 [python-hwpx](https://github.com/airmang/python-hwpx) (Apache-2.0) 를 사용합니다.
+## 라이선스
+
+이 프로젝트의 코드는 [MIT 라이선스](LICENSE) 로 공개합니다.
+
+변환에는 [python-hwpx](https://github.com/airmang/python-hwpx) (Apache-2.0) 등 외부 패키지를 사용하며,
+이 패키지들은 저장소에 포함되지 않고 실행할 때 설치됩니다. 각 패키지의 라이선스는
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 에 정리했습니다.
+
+본 제품은 한글과컴퓨터의 한/글 문서 파일(.hwp) 공개 문서를 참고하여 개발하였습니다.
+"한글", "한컴", "HWP" 는 (주)한글과컴퓨터의 상표이며, 이 프로젝트는 (주)한글과컴퓨터와 관련이 없는 개인 프로젝트입니다.
