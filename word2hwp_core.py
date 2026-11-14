@@ -387,7 +387,8 @@ def count_lines(text: str, size: float, avail_pt: float, ea: str | None, latin: 
         tokens = re.findall(r" +|[!-~]+|[^!-~ ]", part.replace("\t", "    "))
         lines, cur = 1, 0.0
         for tok in tokens:
-            w_ = sum(char_width_em(ch, latin if ord(ch) < 128 else ea) for ch in tok) * size
+            # 한글·한자만 한글 글꼴, 나머지(·, 그리스 문자, 아래첨자 숫자 등)는 영문 글꼴 너비로
+            w_ = sum(char_width_em(ch, ea if is_cjk(ch) else latin) for ch in tok) * size
             if tok.startswith(" "):
                 cur += w_
                 continue
@@ -401,6 +402,49 @@ def count_lines(text: str, size: float, avail_pt: float, ea: str | None, latin: 
             cur += w_
         total_lines += lines
     return total_lines
+
+
+def count_lines_runs(segs, avail_pt: float) -> int:
+    """count_lines 와 같지만 글자 조각마다 자기 글꼴·크기로 너비를 잼.
+    segs: [(글자, 크기pt, 한글 글꼴, 영문 글꼴)]"""
+    import math
+    chars, widths = [], []
+    for text, size, ea, lat in segs:
+        for ch in (text or "").replace("\t", "    "):
+            chars.append(ch)
+            widths.append(0.0 if ch == "\n" else char_width_em(ch, ea if is_cjk(ch) else lat) * size)
+    total, lines, cur = 0, 1, 0.0
+    i, n = 0, len(chars)
+    while i < n:
+        ch = chars[i]
+        if ch == "\n":
+            total += lines
+            lines, cur = 1, 0.0
+            i += 1
+            continue
+        # 낱말 묶음: 영문·숫자 연속은 한 덩어리, 빈칸은 따로, 한글은 글자 단위
+        j = i + 1
+        if ch == " ":
+            while j < n and chars[j] == " ":
+                j += 1
+        elif "!" <= ch <= "~":
+            while j < n and "!" <= chars[j] <= "~":
+                j += 1
+        w_ = sum(widths[i:j])
+        if ch == " ":
+            cur += w_
+        else:
+            if cur + w_ > avail_pt and cur > 0:
+                lines += 1
+                cur = 0.0
+                if w_ > avail_pt:
+                    lines += math.ceil(w_ / avail_pt) - 1
+                    cur = w_ % avail_pt
+                    i = j
+                    continue
+            cur += w_
+        i = j
+    return total + lines
 
 
 def font_line_ratio(name: str | None) -> float:
@@ -437,6 +481,36 @@ def font_line_ratio(name: str | None) -> float:
             if key in name.lower():
                 return val
     return 1.0
+
+
+def is_cjk(ch: str) -> bool:
+    """한글·한자·가나 등 동아시아 글꼴로 그려지는 글자인지"""
+    c = ord(ch)
+    return (0x1100 <= c <= 0x11FF or 0x2E80 <= c <= 0x9FFF or 0xAC00 <= c <= 0xD7AF
+            or 0xF900 <= c <= 0xFAFF or 0xFF00 <= c <= 0xFFEF or 0x3130 <= c <= 0x318F)
+
+
+def word_line_ratio(name: str | None, east_asian: bool) -> float:
+    """Word 의 "1줄" 높이 ÷ 글자 크기.
+
+    영문 글꼴은 글꼴 파일의 줄 높이(winAscent+winDescent) 그대로,
+    한글 등 동아시아 글꼴은 Word/한글 모두 최소 약 1.3배로 줄을 잡는다
+    (바탕·굴림·돋움은 파일 값이 1.0 이지만 실제 화면의 1줄은 글자 크기의 약 1.3배).
+    """
+    if not name:
+        return 1.3 if east_asian else 1.15
+    r = font_line_ratio(name)
+    cjk_font = bool(re.search(r"[ᄀ-￿]", name)) or name.strip().lower() in _EA_LATIN_NAMES
+    if east_asian or cjk_font:
+        return max(r, 1.3)
+    if name.strip().lower() not in (_FONT_INDEX or {}):
+        return max(r, 1.15)   # 이 PC 에 없는 영문 글꼴
+    return r
+
+
+_EA_LATIN_NAMES = {"batang", "batangche", "gulim", "gulimche", "dotum", "dotumche", "gungsuh",
+                   "gungsuhche", "malgun gothic", "nanumgothic", "nanummyeongjo", "ms mincho", "ms gothic",
+                   "simsun", "mingliu", "yu gothic", "yu mincho", "meiryo"}
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +550,9 @@ class ParaFmt:
     num_level: int = 0
     contextual: bool = False
     tabs: dict = field(default_factory=dict)   # pos(twips) -> (종류, 채움)
+    borders: dict = field(default_factory=dict)  # 문단 테두리: side -> border_of() 결과
+    border_space: dict = field(default_factory=dict)  # side -> 글자와 테두리 사이(pt)
+    fill: str | None = None                     # 문단 배경색
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +788,25 @@ def apply_rpr(fmt: dict, rpr) -> None:
                     break
 
 
+def border_of(el):
+    """w:top 등 → (켜짐, 색, 두께 mm, 선 종류). el 이 없으면 None"""
+    if el is None:
+        return None
+    val = wattr(el, "val", "single")
+    if val in ("nil", "none"):
+        return (False, None, 0)
+    try:
+        sz = int(wattr(el, "sz", "4"))
+    except ValueError:
+        sz = 4
+    mm = sz / 8 * 0.3528
+    kind = {"double": "DOUBLE_SLIM", "triple": "SLIM_THICK_SLIM", "dotted": "DOT", "dashed": "DASH",
+            "dashSmallGap": "DASH", "dotDash": "DASH_DOT", "dotDotDash": "DASH_DOT_DOT",
+            "thinThickSmallGap": "THICK_SLIM", "thickThinSmallGap": "SLIM_THICK",
+            "wave": "WAVE", "doubleWave": "WAVE"}.get(val, "SOLID")
+    return (True, hex_color(wattr(el, "color")) or "#000000", mm, kind)
+
+
 def apply_ppr(fmt: ParaFmt, ppr) -> None:
     if ppr is None:
         return
@@ -782,6 +878,26 @@ def apply_ppr(fmt: ParaFmt, ppr) -> None:
             leader = {"dot": "DOT", "middleDot": "DOT", "hyphen": "DASH", "underscore": "SOLID",
                       "heavy": "SOLID"}.get(wattr(t, "leader", "none"), "NONE")
             fmt.tabs[pos] = (kind, leader)
+    pbdr = ppr.find(w("pBdr"))
+    if pbdr is not None:
+        borders, space = dict(fmt.borders), dict(fmt.border_space)
+        for side, alts in (("top", ()), ("bottom", ()), ("left", ("start",)), ("right", ("end",))):
+            el = pbdr.find(w(side))
+            for a in alts:
+                if el is None:
+                    el = pbdr.find(w(a))
+            res = border_of(el)
+            if res is not None:
+                borders[side] = res
+                try:
+                    space[side] = float(wattr(el, "space", "0") or 0)
+                except ValueError:
+                    space[side] = 0.0
+        fmt.borders, fmt.border_space = borders, space
+    pshd = ppr.find(w("shd"))
+    if pshd is not None:
+        fill = hex_color(wattr(pshd, "fill"))
+        fmt.fill = fill if fill and fill != "#FFFFFF" else None
     numpr = ppr.find(w("numPr"))
     if numpr is not None:
         nid = wattr(numpr.find(w("numId")), "val")
@@ -902,6 +1018,7 @@ class Converter:
         self._est = None   # 표 셀 높이 추정용 수집 목록
         self._pending_boxes: list = []   # 문단 뒤에 넣을 글상자
         self._hf = None   # 지금 채우는 머리말/꼬리말
+        self._flow_prev = None   # 같은 흐름(본문/셀) 안의 바로 앞 문단 (간격 계산용)
         self.base_para_pr = self.doc.paragraphs[0].para_pr_id_ref or "0"
 
     # ---------------- 서식 → HWPX id -----------------------------------
@@ -970,9 +1087,13 @@ class Converter:
         apply_ppr(pf, ppr)
         return pf
 
-    def line_percent(self, pf: ParaFmt, font_size: float, font: str | None) -> int:
+    def line_percent(self, pf: ParaFmt, font_size: float, font) -> int:
         # Word 의 1줄 높이(글꼴마다 다름)를 한글 비율 줄간격으로 환산
-        factor = 1.2 * font_line_ratio(font)
+        # font: 글꼴 이름, 또는 ("ratio", 1줄 높이 ÷ 글자 크기)
+        if isinstance(font, tuple):
+            factor = font[1]
+        else:
+            factor = word_line_ratio(font, east_asian=True)
         if pf.line is None:
             pct = 100 * factor
         elif pf.line_rule == "auto":
@@ -994,11 +1115,27 @@ class Converter:
         after = pf.after
         # 탭 위치: Word 는 쪽 여백 기준, 한글은 문단 왼쪽 여백 기준
         tabs = tuple(sorted((p - left, k, l) for p, (k, l) in pf.tabs.items() if p - left > 0))
+        active = {s: b for s, b in pf.borders.items() if b and b[0]}
+        border_key = None
+        if active or pf.fill:
+            border_key = (tuple(sorted(active.items())), pf.fill,
+                          tuple(sorted((s, pf.border_space.get(s, 0)) for s in active)))
         key = (align, left, pf.right, first, before, after,
-               self.line_percent(pf, font_size, font), pf.keep_next, pf.keep_lines, pf.page_break_before, tabs)
+               self.line_percent(pf, font_size, font), pf.keep_next, pf.keep_lines, pf.page_break_before, tabs,
+               border_key)
         if key in self._para_cache:
             return self._para_cache[key]
         hdr = self.doc.oxml.headers[0]
+        border = None
+        if border_key is not None:
+            # Word 문단 테두리/배경 → 한글 문단 테두리 (이어진 같은 테두리 문단은 한 상자로 묶음)
+            try:
+                sp = {s: int(pf.border_space.get(s, 0) * 100) for s in ("left", "right", "top", "bottom")}
+                border = {"borderFillIDRef": self.border_fill_id(active, pf.fill),
+                          "offsetLeft": sp["left"], "offsetRight": sp["right"],
+                          "offsetTop": sp["top"], "offsetBottom": sp["bottom"], "connect": "1"}
+            except Exception as e:
+                self.warnings.append(f"문단 테두리 생략: {e}")
         tab_id = None
         if tabs:
             try:
@@ -1016,6 +1153,7 @@ class Converter:
                      "next": after * TWIP_TO_HWP},
             break_setting={"keep_with_next": pf.keep_next, "keep_lines": pf.keep_lines,
                            "page_break_before": pf.page_break_before},
+            border=border,
         )
         self._para_cache[key] = pid
         return pid
@@ -1332,10 +1470,20 @@ class Converter:
                 if not is_cell:
                     self._pending_break = True
                 break
-            sizes = [f.size for k, v, f in chunk if k == "text" and v.strip()] or [mark_fmt.size]
-            main_size = max(set(sizes), key=sizes.count)
-            fonts = [f.font_ea for k, v, f in chunk if k == "text" and v.strip()] or [mark_fmt.font_ea]
+            # 줄 높이: 한글은 줄 높이를 "그 줄의 가장 큰 글자 크기 × 비율"로 계산하므로
+            # Word 의 1줄 높이(글자마다 글꼴 크기 × 글꼴 줄 높이 중 가장 큰 값)를 가장 큰 글자 크기로 나눈 비율을 씀
+            texts = [(v.strip(), f) for k, v, f in chunk if k == "text" and v.strip()]
+            main_size = max((f.size for t, f in texts), default=mark_fmt.size)
+            word_line = 0.0
+            for t, f in texts or [("가", mark_fmt)]:
+                if any(is_cjk(ch) for ch in t):
+                    word_line = max(word_line, f.size * word_line_ratio(f.font_ea, east_asian=True))
+                if not all(is_cjk(ch) for ch in t):
+                    word_line = max(word_line, f.size * word_line_ratio(f.font_latin, east_asian=False))
+            fonts = [("ratio", word_line / max(main_size, 1))]
             pf_c = replace(pf) if ci == 0 else replace(pf, page_break_before=True, before=0)
+            if ci == 0:
+                pf_c.before = self.flow_before(pf_c, style_id)
             # 수식만 있는 문단(Word 의 "디스플레이 수식")은 수식 정렬을 따름 (기본 가운데)
             eqs = [v for k, v, f in chunk if k == "equation"]
             others = [v for k, v, f in chunk if k == "text" and v.strip()]
@@ -1350,6 +1498,7 @@ class Converter:
             first_fmt = next((f for k, v, f in chunk if k == "text"), mark_fmt)
             para = factory(para_pr, self.char_pr(first_fmt if chunk else mark_fmt))
             paragraphs.append(para)
+            self._flow_prev = (para, pf_c, main_size, fonts[0], style_id or self.pkg.default_para_style)
             has_content = False
             buf, buf_fmt = "", None
             for kind, val, f in chunk:
@@ -1399,10 +1548,68 @@ class Converter:
                 text = "".join(v for k, v, f in chunk if k == "text")
                 img_h = sum(self.image_size(v[0], v[2], v[3], max_w)[1] for k, v, f in chunk if k == "image")
                 lat = next((f.font_latin for k, v, f in chunk if k == "text" and v.strip()), mark_fmt.font_latin)
+                ea = next((f.font_ea for k, v, f in chunk if k == "text" and v.strip()), mark_fmt.font_ea)
+                # 위/아래 첨자는 한글에서 작게 그려지므로 너비도 작게
+                segs = [(v, f.size * (0.6 if f.script else 1.0), f.font_ea, f.font_latin)
+                        for k, v, f in chunk if k == "text"]
                 self._est.append((text, main_size, self.line_percent(pf_c, main_size, fonts[0]),
-                                  pf_c.before, pf_c.after, img_h, fonts[0], lat,
-                                  (pf_c.left + max(pf_c.first_line, 0) + pf_c.right) / 20))
+                                  pf_c.before, pf_c.after, img_h, ea, lat,
+                                  (pf_c.left + max(pf_c.first_line, 0) + pf_c.right) / 20, segs))
         return paragraphs
+
+    def flow_before(self, pf: ParaFmt, style_id: str | None) -> int:
+        """앞 문단과 이어지는 문단 간격 (twips).
+
+        - Word "같은 스타일의 문단 사이에 공백 추가 안 함"(contextualSpacing) 반영
+        - 앞 문단 '아래 간격'과 이 문단 '위 간격' 중 큰 값만 쓰기 (한글이 Word 문서를 열 때와 같은 방식)
+        """
+        prev = self._flow_prev
+        if prev is None or pf.page_break_before:
+            return pf.before   # 쪽 나누기 뒤 첫 문단은 위 간격을 그대로 둠 (한글과 같음)
+        p_para, p_pf, p_size, p_font, p_style = prev
+        same = p_style == (style_id or self.pkg.default_para_style)
+        before = pf.before
+
+        def set_prev_after(value):
+            nonlocal p_pf
+            p_pf = replace(p_pf, after=value)
+            try:
+                p_para.para_pr_id_ref = self.para_pr(p_pf, p_size, p_font)
+                self._flow_prev = (p_para, p_pf, p_size, p_font, p_style)
+            except Exception:
+                pass
+
+        if same and p_pf.contextual and p_pf.after:
+            set_prev_after(0)
+        if same and pf.contextual:
+            before = 0
+        # 문단 테두리(상자): 한글은 문단 위/아래 간격까지 테두리 안에 그리지만 Word 는 상자 밖에 둠
+        # → 상자와 바깥 문단 사이 간격은 상자 밖(바깥 문단 쪽)으로 옮김
+        box, p_box = self.box_key(pf), self.box_key(p_pf)
+        if box != p_box:
+            gap = max(before, p_pf.after, 0)
+            if p_box is not None:          # 상자 → 바깥(또는 다른 상자): 간격을 이 문단 위로
+                set_prev_after(0)
+                # Word 는 테두리 안쪽 여백·선 두께도 문단 높이에 넣지만 한글은 아래 문단 간격에 겹쳐 그림
+                return gap + self.border_pad(p_pf, "bottom")
+            set_prev_after(gap + self.border_pad(pf, "top"))   # 바깥 → 상자: 간격을 앞 문단 아래로
+            return 0
+        return max(0, before - max(p_pf.after, 0))
+
+    @staticmethod
+    def border_pad(pf: ParaFmt, side: str) -> int:
+        """테두리 안쪽 여백 + 선 두께 (twips)"""
+        b = pf.borders.get(side)
+        if not b or not b[0]:
+            return 0
+        return int(pf.border_space.get(side, 0) * 20 + b[2] / 25.4 * 1440)
+
+    @staticmethod
+    def box_key(pf: ParaFmt):
+        active = tuple(sorted((s, b) for s, b in pf.borders.items() if b and b[0]))
+        if not active and not pf.fill:
+            return None
+        return active, pf.fill
 
     def add_equation(self, para, el, fmt) -> bool:
         """Word 수식 → 한글 수식(고칠 수 있는 수식 개체). 안 되면 글자로."""
@@ -1471,7 +1678,13 @@ class Converter:
             ea, lat, indent = (item[6], item[7], item[8]) if len(item) > 8 else (None, None, 0)
             # 실제 글꼴 너비로 한글의 줄 나눔을 흉내 냄
             # (한글은 파일에 저장된 행 높이를 그대로 쓰므로 줄 수가 정확해야 글자가 칸을 넘지 않음)
-            lines = count_lines(text, size, max(avail_pt - indent, 10) * 0.98, ea, lat) if size else 0
+            width = max(avail_pt - indent, 10) * 0.98
+            if not size:
+                lines = 0
+            elif len(item) > 9 and item[9]:
+                lines = count_lines_runs(item[9], width)
+            else:
+                lines = count_lines(text, size, width, ea, lat)
             h = lines * size * pct / 100 if size else 0
             if img_h:
                 h = max(h, img_h / 100 + size * 0.3)
@@ -1480,22 +1693,7 @@ class Converter:
 
     # ---------------- 표 ---------------------------------------------
     def border_of(self, el):
-        """w:top 등 → (켜짐, 색, 두께 mm)"""
-        if el is None:
-            return None
-        val = wattr(el, "val", "single")
-        if val in ("nil", "none"):
-            return (False, None, 0)
-        try:
-            sz = int(wattr(el, "sz", "4"))
-        except ValueError:
-            sz = 4
-        mm = sz / 8 * 0.3528
-        kind = {"double": "DOUBLE_SLIM", "triple": "SLIM_THICK_SLIM", "dotted": "DOT", "dashed": "DASH",
-                "dashSmallGap": "DASH", "dotDash": "DASH_DOT", "dotDotDash": "DASH_DOT_DOT",
-                "thinThickSmallGap": "THICK_SLIM", "thickThinSmallGap": "SLIM_THICK",
-                "wave": "WAVE", "doubleWave": "WAVE"}.get(val, "SOLID")
-        return (True, hex_color(wattr(el, "color")) or "#000000", mm, kind)
+        return border_of(el)
 
     def table_borders(self, tbl_pr, table_style):
         b = {}
@@ -1627,6 +1825,7 @@ class Converter:
         if host is None:
             anchor_pf = ParaFmt(align="LEFT")
             anchor_pr = self.para_pr(anchor_pf, 10, None)
+            anchor_break = self._pending_break
             if self._pending_break:
                 anchor_pr = self.para_pr(replace(anchor_pf, page_break_before=True), 10, None)
                 self._pending_break = False
@@ -1652,8 +1851,11 @@ class Converter:
             pos.set("horzAlign", {"center": "CENTER", "right": "RIGHT", "end": "RIGHT"}.get(jc, "LEFT"))
             pos.set("horzOffset", "0")
         table.element.set("textWrap", "TOP_AND_BOTTOM")
-        # 쪽 경계에서 "나눔"(행 단위): 행 하나가 두 쪽으로 쪼개지지 않고 통째로 다음 쪽으로 감 (Word 와 같은 모양)
-        table.element.set("pageBreak", "TABLE")
+        # 쪽 경계에서 나누기
+        # - 행에 "행을 나눠 다음 쪽으로 넘기지 않음"(cantSplit)이 있으면 행 단위로 (행이 통째로 다음 쪽으로)
+        # - 없으면 Word·한글처럼 행 중간에서도 나눔 (아니면 큰 행 앞에서 쪽 아래가 비어 버림)
+        cant_split = any(on_off(tr.find(f"{w('trPr')}/{w('cantSplit')}")) for tr in rows)
+        table.element.set("pageBreak", "TABLE" if cant_split else "CELL")
         # 머리글 행 반복
         header_rows = set()
         for r, tr in enumerate(rows):
@@ -1773,6 +1975,31 @@ class Converter:
         except Exception:
             pass
         total_h = sum(row_h)
+        # 모든 행의 문단에 "다음 문단과 함께"가 걸려 있으면 Word 는 표를 한 쪽에 모아 둠
+        # → 한 쪽에 들어가는 표라면 한글에서도 "나누지 않음" (한글이 Word 문서를 열 때와 같음)
+        if host is None and nrows > 1 and total_h < getattr(self, "_page_text_h", 0):
+            def row_keeps(tr):
+                for p in tr.iter(w("p")):
+                    ppr = p.find(w("pPr"))
+                    sid = wattr(ppr.find(w("pStyle")) if ppr is not None else None, "val")
+                    if self.para_fmt(ppr, sid, table_style=tstyle).keep_next:
+                        return True
+                return False
+            if all(row_keeps(tr) for tr in rows[:-1]):
+                table.element.set("pageBreak", "NONE")
+                # 나누지 않는 표는 "글자처럼 취급": 표를 담은 문단이 표와 함께 다음 쪽으로 넘어가서
+                # 바로 위 "다음 문단과 함께" 캡션(Table 1. …)도 같이 넘어감
+                if pos is not None:
+                    pos.set("treatAsChar", "1")
+                    pos.set("affectLSpacing", "0")
+                    anchor = table.element.getparent()
+                    while anchor is not None and etree.QName(anchor).localname != "p":
+                        anchor = anchor.getparent()
+                    if anchor is not None:
+                        align = {"center": "CENTER", "right": "RIGHT", "end": "RIGHT"}.get(jc, "LEFT")
+                        anchor.set("paraPrIDRef", str(self.para_pr(
+                            ParaFmt(align=align, line=240, line_rule="auto", page_break_before=anchor_break),
+                            10, ("ratio", 1.0))))   # 줄 간격 100%
         sz = table.element.find(f"{{{HP_NS}}}sz")
         if sz is not None:
             sz.set("height", str(total_h))
@@ -1781,11 +2008,13 @@ class Converter:
 
     def fill_cell(self, cell, tc, part_rels, cell_w, tstyle):
         saved, self._est = self._est, []
+        saved_flow, self._flow_prev = self._flow_prev, None
         try:
             self._fill_cell(cell, tc, part_rels, cell_w, tstyle)
             return self.estimate_height(self._est, cell_w)
         finally:
             self._est = saved
+            self._flow_prev = saved_flow
 
     def _fill_cell(self, cell, tc, part_rels, cell_w, tstyle):
         existing = list(cell.paragraphs)
@@ -1823,6 +2052,7 @@ class Converter:
                 outer = self._est
                 inner_h = self.emit_table(child, cell, part_rels, cell_w) or 0
                 self._est = outer
+                self._flow_prev = None
                 self._est.append(("", 0, 0, 0, 0, inner_h))
             elif tag == "sdt":
                 for p in child.iter(w("p")):
@@ -1935,6 +2165,7 @@ class Converter:
 
         max_w = self.text_width(sect_pr) if sect_pr is not None else 42520
         self._hf = (hf, self.page_num_fmt.get(section_index, (None, None))[0] or "DIGIT")
+        saved_flow, self._flow_prev = self._flow_prev, None
         try:
             for p in paras:
                 self.emit_paragraph(p, factory, rels, max_w, is_cell=True)
@@ -1943,6 +2174,7 @@ class Converter:
             self.warnings.append(f"{label} 일부 생략: {e}")
         finally:
             self._hf = None
+            self._flow_prev = saved_flow
 
     def add_page_field(self, para, kind, fmt):
         """머리말/꼬리말 안에 쪽 번호(PAGE) 또는 전체 쪽 수(TOTAL_PAGE) 자동 번호 넣기"""
@@ -1979,6 +2211,35 @@ class Converter:
             return (wv - int(float(wattr(mar, "left", "1440"))) - int(float(wattr(mar, "right", "1440")))) * TWIP_TO_HWP
         except Exception:
             return 42520
+
+    @staticmethod
+    def is_bare_section_mark(p_el) -> bool:
+        """구역 정보(sectPr)만 있고 글자·그림·나누기가 없는 문단인지"""
+        if p_el.find(f"{w('pPr')}/{w('sectPr')}") is None:
+            return False
+        for el in p_el.iter():
+            if not isinstance(el.tag, str):
+                continue
+            name = etree.QName(el).localname
+            if name in ("t", "drawing", "pict", "object", "br", "tab", "sym", "oMath", "oMathPara",
+                        "footnoteReference", "endnoteReference", "fldChar", "fldSimple") \
+                    and not any(etree.QName(a).localname == "pPr" for a in el.iterancestors()):
+                return False
+        return True
+
+    def text_height(self, sect_pr):
+        """본문 영역 높이 (HWPUNIT)"""
+        try:
+            pg = sect_pr.find(w("pgSz"))
+            mar = sect_pr.find(w("pgMar"))
+            hv = int(float(wattr(pg, "h", "16838")))
+            if wattr(pg, "orient") == "landscape":
+                hv = min(hv, int(float(wattr(pg, "w", "11906"))))
+            top = abs(int(float(wattr(mar, "top", "1440"))))
+            bottom = abs(int(float(wattr(mar, "bottom", "1440"))))
+            return (hv - top - bottom) * TWIP_TO_HWP
+        except Exception:
+            return 0
 
     def convert(self, progress: Callable[[float], None] | None = None):
         body = self.pkg.document.find(w("body"))
@@ -2025,6 +2286,7 @@ class Converter:
             s = min(s, nsec - 1)
             current_sec = s
             max_w = self.text_width(sect_prs[s])
+            self._page_text_h = self.text_height(sect_prs[s])
             section = self.doc.sections[s]
             tag = etree.QName(el).localname
 
@@ -2039,6 +2301,9 @@ class Converter:
                     return p
                 return self.doc.add_paragraph("", section=_section, para_pr_id_ref=para_pr,
                                               char_pr_id_ref=char_pr, include_run=False, inherit_style=False)
+            if tag == "p" and self.is_bare_section_mark(el) and sum(1 for _, bs in blocks if bs == s) > 1:
+                # 구역 나누기만 들어 있는 빈 문단: 한 줄을 차지해 빈 쪽이 생기지 않도록 건너뜀
+                continue
             try:
                 if tag == "p":
                     self.emit_paragraph(el, factory, rels, max_w)
@@ -2071,6 +2336,7 @@ class Converter:
             progress(1.0)
 
     def emit_table_in_section(self, tbl_el, section, rels, max_w):
+        self._flow_prev = None   # 표 다음 문단은 앞 간격을 그대로
         orig = self.doc.add_table
 
         def add_table(rows, cols, **kw):
@@ -2087,10 +2353,38 @@ class Converter:
         for hdr in self.doc.oxml.headers:
             for cp in hdr.element.iter(f"{HH}charPr"):
                 cp.set("useFontSpace", "1")
+            for font in hdr.element.iter(f"{HH}font"):
+                self.add_font_substitute(font, HH)
             try:
                 hdr.mark_dirty()
             except Exception:
                 hdr._dirty = True
+
+    @staticmethod
+    def add_font_substitute(font, HH):
+        """이 PC 에 없는 글꼴(예: HY견고딕)에 대체 글꼴과 글꼴 계열을 적어 둠.
+
+        없으면 한글이 영문을 기본 명조 계열로 그려서 고딕 제목의 영문만 바탕체처럼 보인다.
+        """
+        face = (font.get("face") or "").strip()
+        if not face or font.find(f"{HH}substFont") is not None:
+            return
+        low = face.lower()
+        if low.startswith(("함초롬", "hcr")):
+            return   # 한글 기본 글꼴
+        font_line_ratio(None)  # 설치된 글꼴 색인
+        if low in (_FONT_INDEX or {}):
+            return
+        serif = any(k in low for k in ("바탕", "명조", "batang", "myeongjo", "궁서", "gungsuh", "serif",
+                                       "times", "신명", "georgia", "garamond", "cambria", "mincho", "song"))
+        subst = "바탕" if serif else "맑은 고딕"
+        attrs = {"face": subst, "type": "TTF", "isEmbedded": "0", "binaryItemIDRef": ""}
+        font.insert(0, font.makeelement(f"{HH}substFont", attrs))
+        if font.find(f"{HH}typeInfo") is None:
+            font.append(font.makeelement(f"{HH}typeInfo", {
+                "familyType": "FCAT_MYUNGJO" if serif else "FCAT_GOTHIC",
+                "weight": "6", "proportion": "4", "contrast": "0", "strokeVariation": "1",
+                "armStyle": "1", "letterform": "1", "midline": "1", "xHeight": "1"}))
 
     def save(self, out_path: str):
         self.finalize()
