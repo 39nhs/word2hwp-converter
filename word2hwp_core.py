@@ -27,6 +27,8 @@ R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 V = "urn:schemas-microsoft-com:vml"
+O = "urn:schemas-microsoft-com:office:office"
+WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
 MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 HP_NS = "http://www.hancom.co.kr/hwpml/2011/paragraph"
 PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -72,6 +74,30 @@ _SYMBOL_MAP.update({"\xb4": "×", "\xb1": "±", "\xa3": "≤", "\xb3": "≥", "\
                     "\x60": "‾", "\x22": "∀", "\x24": "∃", "\x27": "∋", "\x40": "≅", "\x5e": "⊥"})
 WINGDINGS = {0xFC: "✓", 0xFB: "✗", 0xA7: "▪", 0xD8: "➢", 0x6C: "●", 0x6E: "■", 0x71: "❑",
              0x76: "❖", 0xA8: "◻", 0x9F: "•", 0xE0: "→", 0xE8: "➔", 0x4A: "☺", 0x77: "◆", 0xAB: "★"}
+
+
+_BORDER_KINDS = {"double": "DOUBLE_SLIM", "triple": "SLIM_THICK_SLIM", "dotted": "DOT", "dashed": "DASH",
+                 "dashSmallGap": "DASH", "dotDash": "DASH_DOT", "dotDotDash": "DASH_DOT_DOT",
+                 "thinThickSmallGap": "THICK_SLIM", "thickThinSmallGap": "SLIM_THICK",
+                 "wave": "WAVE", "doubleWave": "WAVE"}
+
+
+def parse_border(el):
+    """w:top/w:bottom 등 → (색, 두께 mm, 종류, 간격 pt). 선 없음이면 None"""
+    val = el.get(f"{{{W}}}val", "single")
+    if val in ("nil", "none"):
+        return None
+    try:
+        sz = int(el.get(f"{{{W}}}sz", "4"))
+    except ValueError:
+        sz = 4
+    try:
+        space = int(el.get(f"{{{W}}}space", "1"))
+    except ValueError:
+        space = 1
+    color = el.get(f"{{{W}}}color")
+    color = "#" + color.upper() if color and re.fullmatch(r"[0-9A-Fa-f]{6}", color) else "#000000"
+    return (color, sz / 8 * 0.3528, _BORDER_KINDS.get(val, "SOLID"), space)
 
 
 def symbol_char(ch: str) -> str:
@@ -476,6 +502,10 @@ class ParaFmt:
     num_level: int = 0
     contextual: bool = False
     tabs: dict = field(default_factory=dict)   # pos(twips) -> (종류, 채움)
+    # 문단 테두리: 면 -> (색, 두께 mm, 종류, 글과의 간격 pt). Word 의 w:pBdr 와 가로줄(o:hr)
+    borders: dict = field(default_factory=dict)
+    border_connect: bool = True
+    shade: str | None = None   # 문단 배경색
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +626,30 @@ class DocxPackage:
                     notes[wattr(n, "id")] = "\n".join(paras).strip()
             cache[kind] = notes
         return cache[kind].get(note_id, "")
+
+    def theme_colors(self):
+        if hasattr(self, "_theme_colors"):
+            return self._theme_colors
+        cols = {}
+        name = next((n for n in self.names if re.match(r"word/theme/theme\d*\.xml$", n)), None)
+        root = self._xml(name) if name else None
+        if root is not None:
+            scheme = root.find(f".//{{{A}}}clrScheme")
+            if scheme is not None:
+                for c in scheme:
+                    k = etree.QName(c).localname
+                    v = c.find(f"{{{A}}}srgbClr")
+                    sysc = c.find(f"{{{A}}}sysClr")
+                    val = v.get("val") if v is not None else (sysc.get("lastClr") if sysc is not None else None)
+                    if val:
+                        cols[k] = "#" + val.upper()
+        cols.setdefault("dk1", "#000000")
+        cols.setdefault("lt1", "#FFFFFF")
+        for a, b in (("tx1", "dk1"), ("bg1", "lt1"), ("tx2", "dk2"), ("bg2", "lt2")):
+            if b in cols:
+                cols[a] = cols[b]
+        self._theme_colors = cols
+        return cols
 
     def _theme_fonts(self):
         fonts = {}
@@ -766,6 +820,24 @@ def apply_ppr(fmt: ParaFmt, ppr) -> None:
         v = on_off(ppr.find(w(tag)))
         if v is not None:
             setattr(fmt, key, v)
+    pshd = ppr.find(w("shd"))
+    if pshd is not None:
+        fill = pshd.get(f"{{{W}}}fill")
+        fmt.shade = ("#" + fill.upper()) if fill and re.fullmatch(r"[0-9A-Fa-f]{6}", fill) and fill.upper() != "FFFFFF" else None
+    pbdr = ppr.find(w("pBdr"))
+    if pbdr is not None:
+        fmt.borders = dict(fmt.borders)
+        for side in ("top", "bottom", "left", "right"):
+            el = pbdr.find(w(side))
+            if el is None:
+                el = pbdr.find(w({"left": "start", "right": "end"}.get(side, side)))
+            if el is None:
+                continue
+            spec = parse_border(el)
+            if spec is None:
+                fmt.borders.pop(side, None)
+            else:
+                fmt.borders[side] = spec
     tabs = ppr.find(w("tabs"))
     if tabs is not None:
         fmt.tabs = dict(fmt.tabs)
@@ -902,6 +974,8 @@ class Converter:
         self._est = None   # 표 셀 높이 추정용 수집 목록
         self._pending_boxes: list = []   # 문단 뒤에 넣을 글상자
         self._hf = None   # 지금 채우는 머리말/꼬리말
+        self._tbl_rprs = None   # 지금 셀에 적용되는 표 스타일 글자 서식들
+        self._tbl_pprs = None   # 지금 셀에 적용되는 표 스타일 조건부 문단 서식들
         self.base_para_pr = self.doc.paragraphs[0].para_pr_id_ref or "0"
 
     # ---------------- 서식 → HWPX id -----------------------------------
@@ -916,8 +990,16 @@ class Converter:
     def run_fmt(self, para_style: str | None, rpr_list) -> RunFmt:
         d: dict = {}
         apply_rpr(d, self.pkg.doc_rpr)
+        tbl_rprs = self._tbl_rprs or []
+        default_para = para_style in (None, self.pkg.default_para_style)
+        if not default_para:          # 표 스타일 < 문단 스타일
+            for r_ in tbl_rprs:
+                apply_rpr(d, r_)
         for st in self.pkg.style_chain(para_style or self.pkg.default_para_style):
             apply_rpr(d, st.find(w("rPr")))
+        if default_para:              # 기본 문단 스타일이면 표 스타일이 이김 (Word 규칙)
+            for r_ in tbl_rprs:
+                apply_rpr(d, r_)
         for rpr in rpr_list:
             if rpr is None:
                 continue
@@ -962,6 +1044,8 @@ class Converter:
         if table_style:
             for st in self.pkg.style_chain(table_style):
                 apply_ppr(pf, st.find(w("pPr")))
+            for p_ in self._tbl_pprs or []:
+                apply_ppr(pf, p_)
         chain = self.pkg.style_chain(style_id or self.pkg.default_para_style)
         for st in chain:
             apply_ppr(pf, st.find(w("pPr")))
@@ -994,8 +1078,10 @@ class Converter:
         after = pf.after
         # 탭 위치: Word 는 쪽 여백 기준, 한글은 문단 왼쪽 여백 기준
         tabs = tuple(sorted((p - left, k, l) for p, (k, l) in pf.tabs.items() if p - left > 0))
+        borders = tuple(sorted(pf.borders.items())) + ((("shade", pf.shade),) if pf.shade else ())
         key = (align, left, pf.right, first, before, after,
-               self.line_percent(pf, font_size, font), pf.keep_next, pf.keep_lines, pf.page_break_before, tabs)
+               self.line_percent(pf, font_size, font), pf.keep_next, pf.keep_lines, pf.page_break_before, tabs,
+               borders, pf.border_connect)
         if key in self._para_cache:
             return self._para_cache[key]
         hdr = self.doc.oxml.headers[0]
@@ -1006,7 +1092,9 @@ class Converter:
                     tab_stops=[{"pos": p * TWIP_TO_HWP, "type": k, "leader": l} for p, k, l in tabs])
             except Exception as e:
                 self.warnings.append(f"탭 설정 생략: {e}")
+        border_attrs = self.paragraph_border(hdr, pf) if borders else None
         pid = hdr.ensure_paragraph_format(
+            border=border_attrs,
             tab_pr_id_ref=tab_id,
             base_para_pr_id=self.base_para_pr,
             alignment=align,
@@ -1019,6 +1107,24 @@ class Converter:
         )
         self._para_cache[key] = pid
         return pid
+
+    def paragraph_border(self, hdr, pf):
+        """Word 문단 테두리/가로줄/문단 배경색 → 한글 문단 테두리 (hh:border)"""
+        sides = [s_ for s_ in ("left", "right", "top", "bottom") if s_ in pf.borders]
+        color, width_mm, kind, _ = pf.borders[sides[0]] if sides else ("#000000", 0.12, "SOLID", 0)
+        width = min(HWP_LINE_WIDTHS, key=lambda x: abs(x - max(width_mm, 0.1)))
+        try:
+            extra = {"fill_color": pf.shade} if pf.shade else {}
+            bf = hdr.ensure_border_fill(border_color=color, border_width=f"{width} mm",
+                                        active_borders=sides, border_type=kind, **extra)
+        except Exception as e:
+            self.warnings.append(f"문단 테두리 일부 생략: {e}")
+            return None
+        def off(side):  # 글과 테두리 사이 간격 (pt → HWPUNIT)
+            return str(int(pf.borders[side][3] * 100)) if side in pf.borders else "0"
+        return {"borderFillIDRef": str(bf), "offsetLeft": off("left"), "offsetRight": off("right"),
+                "offsetTop": off("top"), "offsetBottom": off("bottom"),
+                "connect": "1" if pf.border_connect else "0", "ignoreMargin": "0"}
 
     # ---------------- 문단 내용 수집 -----------------------------------
     def collect_runs(self, p_el, para_style, part_rels):
@@ -1055,6 +1161,22 @@ class Converter:
                 for c in el:
                     walk(c, rpr_stack)
                 return
+            if tag == "hyperlink":
+                rid = el.get(f"{{{R}}}id")
+                url = part_rels.get(rid, (None,))[0] if rid else None
+                if not url and wattr(el, "anchor"):
+                    url = "#" + wattr(el, "anchor")
+                if url:
+                    start = len(items)
+                    for c in el:
+                        walk(c, rpr_stack)
+                    inner = items[start:]
+                    del items[start:]
+                    texts = [(v, f) for k, v, f in inner if k == "text"]
+                    if texts and "".join(v for v, f in texts).strip():
+                        items.append(("link", (url, "".join(v for v, f in texts)), texts[0][1]))
+                    items.extend(it for it in inner if it[0] != "text")
+                    return
             if tag in ("hyperlink", "ins", "smartTag", "sdt", "sdtContent", "customXml", "moveTo", "dir", "bdo"):
                 for c in el:
                     if isinstance(c.tag, str) and etree.QName(c).localname in ("sdtPr", "sdtEndPr", "smartTagPr", "customXmlPr"):
@@ -1183,6 +1305,20 @@ class Converter:
         imgs = [i for i in self.extract_images(el, part_rels)]
         out += [("image", i) for i in imgs]
         if not out:
+            # Word 의 "가로줄" (VML 사각형에 o:hr="t") → 문단 아래 선
+            for shape in el.iter(f"{{{V}}}rect", f"{{{V}}}line", f"{{{V}}}shape"):
+                if shape.get(f"{{{O}}}hr") in ("t", "true", "1"):
+                    style = shape.get("style", "")
+                    m = re.search(r"height:\s*([\d.]+)pt", style)
+                    h_pt = float(m.group(1)) if m else 1.5
+                    fill = shape.get("fillcolor", "")
+                    color = fill if re.fullmatch(r"#[0-9A-Fa-f]{6}", fill or "") else "#A0A0A0"
+                    no_shade = shape.get(f"{{{O}}}hrnoshade") in ("t", "true")
+                    out.append(("hr", (color if no_shade or fill else "#A0A0A0", h_pt)))
+                    return out
+        if not out:
+            out += self.extract_shapes(el)
+        if not out:
             uris = [g.get("uri", "") for g in el.iter(f"{{{A}}}graphicData")]
             if any("chart" in u for u in uris):
                 out.append(("text", "[차트]"))
@@ -1192,6 +1328,115 @@ class Converter:
                 out.append(("text", " / ".join(texts) if texts else "[SmartArt]"))
                 self.warnings.append("SmartArt 도형은 글자만 옮겼습니다.")
         return out
+
+    def _drawing_color(self, holder, fallback):
+        """a:solidFill/a:srgbClr 또는 a:schemeClr → #RRGGBB"""
+        if holder is None:
+            return fallback
+        if holder.find(f"{{{A}}}noFill") is not None:
+            return None
+        sf = holder.find(f"{{{A}}}solidFill")
+        src = sf if sf is not None else holder
+        rgb = src.find(f"{{{A}}}srgbClr")
+        if rgb is not None and rgb.get("val"):
+            return "#" + rgb.get("val").upper()
+        sch = src.find(f"{{{A}}}schemeClr")
+        if sch is not None:
+            return self.pkg.theme_colors().get(sch.get("val"), fallback)
+        return fallback
+
+    def extract_shapes(self, el):
+        """글자 없는 DrawingML 도형(선·사각형·타원) → 한글 그리기 개체 정보"""
+        out = []
+        for wsp in el.iter(f"{{{WPS}}}wsp"):
+            if wsp.find(f".//{{{W}}}txbxContent") is not None:
+                continue
+            geom = wsp.find(f".//{{{A}}}prstGeom")
+            prst = geom.get("prst") if geom is not None else "rect"
+            kind = ("line" if prst in ("line", "straightConnector1", "bentConnector2") else
+                    "ellipse" if prst in ("ellipse", "circle") else
+                    "rect" if prst in ("rect", "roundRect", "snipRect", "flowChartProcess") else None)
+            anchor = next((a for a in wsp.iterancestors() if isinstance(a.tag, str)
+                           and etree.QName(a).localname in ("inline", "anchor")), None)
+            if kind is None or anchor is None:
+                self.warnings.append(f"도형({prst})은 옮기지 못했습니다.")
+                continue
+            ext = anchor.find(f"{{{WP}}}extent")
+            cx, cy = (int(ext.get("cx", 0)), int(ext.get("cy", 0))) if ext is not None else (0, 0)
+            xfrm = wsp.find(f".//{{{A}}}xfrm")
+            flip_h = xfrm is not None and xfrm.get("flipH") == "1"
+            flip_v = xfrm is not None and xfrm.get("flipV") == "1"
+            sppr = wsp.find(f"{{{WPS}}}spPr")
+            ln = sppr.find(f"{{{A}}}ln") if sppr is not None else None
+            style = wsp.find(f"{{{WPS}}}style")
+            ln_ref = style.find(f"{{{A}}}lnRef") if style is not None else None
+            fill_ref = style.find(f"{{{A}}}fillRef") if style is not None else None
+            line_color = self._drawing_color(ln, self._drawing_color(ln_ref, "#000000"))
+            try:
+                line_w = int(ln.get("w")) if ln is not None and ln.get("w") else 9525
+            except ValueError:
+                line_w = 9525
+            fill = None
+            if kind != "line":
+                fill = self._drawing_color(sppr, None)
+                if fill is None and sppr is not None and sppr.find(f"{{{A}}}noFill") is None \
+                        and fill_ref is not None and fill_ref.get("idx", "0") != "0":
+                    fill = self._drawing_color(fill_ref, None)
+            spec = {"kind": kind, "cx": cx, "cy": cy, "flip_h": flip_h, "flip_v": flip_v,
+                    "color": line_color, "width": max(line_w // 127, 10), "fill": fill,
+                    "floating": etree.QName(anchor).localname == "anchor", "round": prst == "roundRect"}
+            if spec["floating"]:
+                ph, pv = anchor.find(f"{{{WP}}}positionH"), anchor.find(f"{{{WP}}}positionV")
+
+                def pos(e):
+                    if e is None:
+                        return ("column", 0, None)
+                    off = e.find(f"{{{WP}}}posOffset")
+                    al = e.find(f"{{{WP}}}align")
+                    return (e.get("relativeFrom", "column"), int(off.text) if off is not None and off.text else 0,
+                            al.text if al is not None else None)
+                spec["h"], spec["v"] = pos(ph), pos(pv)
+                spec["behind"] = anchor.get("behindDoc") == "1"
+                spec["wrap_none"] = anchor.find(f"{{{WP}}}wrapNone") is not None
+            out.append(("shape", spec))
+        return out
+
+    def add_drawing_shape(self, para, spec):
+        """한글 그리기 개체(선/사각형/타원) 넣기, Word 와 같은 위치·크기·색"""
+        w_, h_ = max(spec["cx"] // 127, 1), max(spec["cy"] // 127, 1)
+        color = spec["color"] or "#000000"
+        common = dict(line_color=color, line_width=str(spec["width"]),
+                      treat_as_char=not spec["floating"], paragraph=para)
+        if spec["kind"] == "line":
+            x0, x1 = (w_, 0) if spec["flip_h"] else (0, w_)
+            y0, y1 = (spec["cy"] // 127, 0) if spec["flip_v"] else (0, spec["cy"] // 127)
+            shape = self.doc.shapes.add_line(x0, y0, x1, y1, **common)
+        elif spec["kind"] == "ellipse":
+            shape = self.doc.shapes.add_ellipse(w_, h_, fill_color=spec["fill"], **common)
+        else:
+            shape = self.doc.shapes.add_rectangle(w_, h_, ratio=20 if spec["round"] else 0,
+                                                  fill_color=spec["fill"], **common)
+        if spec["floating"]:
+            el = shape.element
+            pos = el.find(f"{{{HP_NS}}}pos")
+            if pos is not None:
+                rel_h, off_h, al_h = spec["h"]
+                rel_v, off_v, al_v = spec["v"]
+                pos.set("treatAsChar", "0")
+                pos.set("horzRelTo", {"page": "PAPER", "margin": "PAGE", "leftMargin": "PAPER",
+                                      "insideMargin": "PAGE", "column": "COLUMN",
+                                      "character": "PARA"}.get(rel_h, "COLUMN"))
+                pos.set("vertRelTo", {"page": "PAPER", "margin": "PAGE", "topMargin": "PAPER",
+                                      "paragraph": "PARA", "line": "PARA"}.get(rel_v, "PARA"))
+                pos.set("horzAlign", {"center": "CENTER", "right": "RIGHT", "inside": "LEFT",
+                                      "outside": "RIGHT"}.get(al_h or "", "LEFT"))
+                pos.set("vertAlign", {"center": "CENTER", "bottom": "BOTTOM"}.get(al_v or "", "TOP"))
+                pos.set("horzOffset", str(off_h // 127 if not al_h else 0))
+                pos.set("vertOffset", str(off_v // 127 if not al_v else 0))
+                pos.set("flowWithText", "1" if rel_v in ("paragraph", "line") else "0")
+            el.set("textWrap", "BEHIND_TEXT" if spec.get("behind") else
+                   "IN_FRONT_OF_TEXT" if spec.get("wrap_none", True) else "SQUARE")
+        return True
 
     def extract_images(self, el, part_rels):
         out = []
@@ -1337,6 +1582,17 @@ class Converter:
             fonts = [f.font_ea for k, v, f in chunk if k == "text" and v.strip()] or [mark_fmt.font_ea]
             pf_c = replace(pf) if ci == 0 else replace(pf, page_break_before=True, before=0)
             # 수식만 있는 문단(Word 의 "디스플레이 수식")은 수식 정렬을 따름 (기본 가운데)
+            hrs = [v for k, v, f in chunk if k == "hr"]
+            if hrs:
+                color, h_pt = hrs[0]
+                pf_c.borders = dict(pf_c.borders)
+                pf_c.borders["bottom"] = (color, h_pt * 0.3528, "SOLID", 1)
+                pf_c.border_connect = False
+                if not [v for k, v, f in chunk if k == "text" and v.strip()]:
+                    # 가로줄만 있는 문단: Word 처럼 선 두께만큼만 차지하도록 아주 작은 글자 크기로
+                    main_size = max(h_pt + 1, 2)
+                    mark_fmt = replace(mark_fmt, size=main_size)
+                    pf_c.line, pf_c.line_rule = 240, "auto"
             eqs = [v for k, v, f in chunk if k == "equation"]
             others = [v for k, v, f in chunk if k == "text" and v.strip()]
             if eqs and not others and any(etree.QName(e).localname == "oMathPara" for e in eqs):
@@ -1388,6 +1644,20 @@ class Converter:
                                          char_pr_id_ref=self.char_pr(f))
                             self.warnings.append(f"각주를 본문 괄호로 옮김: {e}")
                             has_content = True
+                    elif kind == "shape":
+                        try:
+                            self.add_drawing_shape(para, val)
+                            has_content = True
+                        except Exception as e:
+                            self.warnings.append(f"도형 넣기 실패: {e}")
+                    elif kind == "link":
+                        url, text = val
+                        try:
+                            para.add_hyperlink(url, text, char_pr_id_ref=self.char_pr(f))
+                        except Exception as e:
+                            para.add_run(text, char_pr_id_ref=self.char_pr(f))
+                            self.warnings.append(f"하이퍼링크를 글자로만 옮김: {e}")
+                        has_content = True
                     elif kind == "textbox":
                         self._pending_boxes.append(val)
             if buf or buf_fmt is not None:
@@ -1396,7 +1666,7 @@ class Converter:
             if not has_content:
                 para.add_run("", char_pr_id_ref=self.char_pr(mark_fmt))
             if self._est is not None:
-                text = "".join(v for k, v, f in chunk if k == "text")
+                text = "".join(v if k == "text" else v[1] for k, v, f in chunk if k in ("text", "link"))
                 img_h = sum(self.image_size(v[0], v[2], v[3], max_w)[1] for k, v, f in chunk if k == "image")
                 lat = next((f.font_latin for k, v, f in chunk if k == "text" and v.strip()), mark_fmt.font_latin)
                 self._est.append((text, main_size, self.line_percent(pf_c, main_size, fonts[0]),
@@ -1536,6 +1806,60 @@ class Converter:
                     break
         return out
 
+    COND_ORDER = ("band1Vert", "band2Vert", "band1Horz", "band2Horz", "firstCol", "lastCol",
+                  "firstRow", "lastRow", "neCell", "nwCell", "seCell", "swCell")
+
+    @staticmethod
+    def table_look(tbl_pr):
+        d = {"firstRow": True, "lastRow": False, "firstColumn": True, "lastColumn": False,
+             "noHBand": False, "noVBand": True}
+        lk = tbl_pr.find(w("tblLook")) if tbl_pr is not None else None
+        if lk is None:
+            return d
+        v = wattr(lk, "val")
+        if v:
+            try:
+                n = int(v, 16)
+                d = {"firstRow": bool(n & 0x20), "lastRow": bool(n & 0x40), "firstColumn": bool(n & 0x80),
+                     "lastColumn": bool(n & 0x100), "noHBand": bool(n & 0x200), "noVBand": bool(n & 0x400)}
+            except ValueError:
+                pass
+        for k in list(d):
+            a = wattr(lk, k)
+            if a is not None:
+                d[k] = a in ("1", "true", "on")
+        return d
+
+    def table_conditions(self, tstyle):
+        """표 스타일의 조건부 서식 (첫 행, 첫 열, 줄무늬 등) → {종류: tblStylePr}"""
+        cond = {}
+        for st in self.pkg.style_chain(tstyle):
+            for c in st.findall(w("tblStylePr")):
+                cond[wattr(c, "type")] = c
+        return cond
+
+    def cell_conditions(self, cond, look, r0, c0, r1, c1, nrows, ncols, band_r=1, band_c=1):
+        if not cond:
+            return []
+        first_r, last_r = look["firstRow"] and r0 == 0, look["lastRow"] and r1 >= nrows - 1
+        first_c, last_c = look["firstColumn"] and c0 == 0, look["lastColumn"] and c1 >= ncols - 1
+        hit = set()
+        if not look["noVBand"] and not (first_c or last_c):
+            idx = (c0 - (1 if look["firstColumn"] else 0)) // max(band_c, 1)
+            hit.add("band1Vert" if idx % 2 == 0 else "band2Vert")
+        if not look["noHBand"] and not (first_r or last_r):
+            idx = (r0 - (1 if look["firstRow"] else 0)) // max(band_r, 1)
+            hit.add("band1Horz" if idx % 2 == 0 else "band2Horz")
+        if first_c: hit.add("firstCol")
+        if last_c: hit.add("lastCol")
+        if first_r: hit.add("firstRow")
+        if last_r: hit.add("lastRow")
+        if first_r and first_c: hit.add("nwCell")
+        if first_r and last_c: hit.add("neCell")
+        if last_r and first_c: hit.add("swCell")
+        if last_r and last_c: hit.add("seCell")
+        return [cond[t] for t in self.COND_ORDER if t in hit and t in cond]
+
     def border_fill_id(self, sides: dict, fill: str | None):
         active = [s for s in ("left", "right", "top", "bottom") if sides.get(s) and sides[s][0]]
         color = next((sides[s][1] for s in active), "#000000")
@@ -1665,6 +1989,22 @@ class Converter:
         if header_rows:
             table.element.set("repeatHeader", "1")
 
+        # 표 스타일 조건부 서식
+        look = self.table_look(tbl_pr)
+        cond = self.table_conditions(tstyle)
+        base_rprs = [st.find(w("rPr")) for st in self.pkg.style_chain(tstyle)]
+        base_tcprs = [st.find(w("tcPr")) for st in self.pkg.style_chain(tstyle)]
+        band_r = band_c = 1
+        for st in self.pkg.style_chain(tstyle):
+            tp = st.find(w("tblPr"))
+            if tp is not None:
+                for tag, which in (("tblStyleRowBandSize", "r"), ("tblStyleColBandSize", "c")):
+                    e = tp.find(w(tag))
+                    if e is not None and (wattr(e, "val") or "").isdigit():
+                        if which == "r": band_r = int(wattr(e, "val"))
+                        else: band_c = int(wattr(e, "val"))
+        saved_state = (self._tbl_rprs, self._tbl_pprs)
+
         # 셀 채우기
         cell_need: dict = {}
         for (r0, c0, r1, c1, tc) in layout:
@@ -1682,6 +2022,24 @@ class Converter:
                 "right": borders.get("right") if c1 >= ncols - 1 else borders.get("insideV"),
             }
             fill = None
+            conds = self.cell_conditions(cond, look, r0, c0, r1, c1, nrows, ncols, band_r, band_c)
+            for ctp in base_tcprs + [c_.find(w("tcPr")) for c_ in conds]:
+                if ctp is None:
+                    continue
+                cshd = ctp.find(w("shd"))
+                if cshd is not None:
+                    fill = hex_color(wattr(cshd, "fill")) or fill
+                ctcb = ctp.find(w("tcBorders"))
+                if ctcb is not None:
+                    for side, alt in (("top", None), ("bottom", None), ("left", "start"), ("right", "end")):
+                        el = ctcb.find(w(side))
+                        if el is None and alt:
+                            el = ctcb.find(w(alt))
+                        bres = self.border_of(el)
+                        if bres is not None:
+                            sides[side] = bres
+            self._tbl_rprs = [r_ for r_ in base_rprs + [c_.find(w("rPr")) for c_ in conds] if r_ is not None] or None
+            self._tbl_pprs = [p_ for p_ in [c_.find(w("pPr")) for c_ in conds] if p_ is not None] or None
             if tcpr is not None:
                 tcb = tcpr.find(w("tcBorders"))
                 if tcb is not None:
@@ -1693,7 +2051,7 @@ class Converter:
                         if bres is not None:
                             sides[side] = bres
                 shd = tcpr.find(w("shd"))
-                if shd is not None:
+                if shd is not None and wattr(shd, "fill") not in (None, "auto"):
                     fill = hex_color(wattr(shd, "fill"))
             try:
                 cell.element.set("borderFillIDRef", self.border_fill_id(sides, fill))
@@ -1718,6 +2076,8 @@ class Converter:
             content_h = self.fill_cell(cell, tc, part_rels, cell_w, tstyle)
             need = content_h + int((mar["top"] + mar["bottom"]) * TWIP_TO_HWP) + 100
             cell_need[(r0, c0)] = (r1, need)
+
+        self._tbl_rprs, self._tbl_pprs = saved_state
 
         # 원본에 칸이 없는 자리(gridBefore/After 등)는 테두리 없이
         covered = set()
