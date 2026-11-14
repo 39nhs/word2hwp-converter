@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>워드 한글 변환기</title>
+<meta name="description" content="Word(.docx) 파일을 한글(.hwp/.hwpx) 파일로 바꿔 줍니다. 파일은 서버로 보내지 않고 브라우저 안에서 변환합니다.">
+<style>
+  :root {
+    --bg: #f5f7fb; --card: #ffffff; --text: #1a2b4c; --muted: #5a6478; --line: #dfe4ee;
+    --accent: #2b6ce6; --accent-weak: #e8f0fe; --ok: #1e8e3e; --warn: #b06000; --err: #d93025;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151c; --card: #1a202a; --text: #e6ebf3; --muted: #9aa5b8; --line: #2c3442;
+      --accent: #6ea0ff; --accent-weak: #1d2a44; --ok: #5cc27a; --warn: #f0a543; --err: #ff7a6e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: "Pretendard", "Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.02em; }
+  .lead { color: var(--muted); margin: 0 0 20px; line-height: 1.6; }
+  .badge { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ok);
+           background: color-mix(in srgb, var(--ok) 12%, transparent); padding: 4px 10px; border-radius: 999px; margin-bottom: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  #drop { border: 2px dashed var(--accent); border-radius: 12px; padding: 36px 16px; text-align: center;
+          background: var(--accent-weak); cursor: pointer; transition: background .15s, transform .15s; }
+  #drop.over { transform: scale(1.01); background: color-mix(in srgb, var(--accent) 20%, var(--card)); }
+  #drop strong { display: block; font-size: 19px; color: var(--accent); margin-bottom: 6px; }
+  #drop span { color: var(--muted); font-size: 14px; }
+  #drop.disabled { opacity: .55; cursor: progress; }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-top: 16px; font-size: 15px; }
+  .row label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .progress { margin-top: 16px; }
+  .bar { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  #statusText { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  ul#list { list-style: none; padding: 0; margin: 16px 0 0; }
+  #list li { display: flex; gap: 12px; align-items: center; justify-content: space-between;
+             padding: 12px 0; border-top: 1px solid var(--line); }
+  #list .name { font-weight: 600; word-break: break-all; }
+  #list .state { font-size: 13px; color: var(--muted); margin-top: 2px; }
+  #list .state.ok { color: var(--ok); } #list .state.warn { color: var(--warn); } #list .state.err { color: var(--err); }
+  .btn { appearance: none; border: 0; background: var(--accent); color: #fff; padding: 9px 14px; border-radius: 9px;
+         font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; text-decoration: none; }
+  .btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  details { margin-top: 20px; }
+  details summary { cursor: pointer; font-weight: 600; }
+  details p, details li { color: var(--muted); line-height: 1.65; font-size: 14px; }
+  footer { margin-top: 28px; font-size: 12.5px; color: var(--muted); line-height: 1.7; }
+  footer a, details a { color: var(--accent); }
+  @media (max-width: 520px) { h1 { font-size: 23px; } #list li { flex-direction: column; align-items: flex-start; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>워드 → 한글 변환기</h1>
+  <p class="lead">Word 파일(.docx)을 한글 파일(.hwp / .hwpx)로 바꿔 줍니다.
+    변환된 파일은 한글에서 글자·표·수식을 그대로 고칠 수 있습니다.</p>
+  <div class="badge">🔒 파일은 서버로 올라가지 않고, 이 브라우저 안에서만 변환됩니다</div>
+
+  <section class="card">
+    <div id="drop" class="disabled" role="button" tabindex="0" aria-label="Word 파일 고르기">
+      <strong>여기에 Word 파일을 끌어다 놓으세요</strong>
+      <span>또는 눌러서 파일 고르기 · 여러 개 가능 (.docx)</span>
+    </div>
+    <input id="file" type="file" accept=".docx,.docm,.dotx,.dotm" multiple hidden>
+    <div class="row">
+      <span>저장 형식:</span>
+      <label><input type="radio" name="fmt" value="hwp" checked> .hwp (기본 한글 파일)</label>
+      <label><input type="radio" name="fmt" value="hwpx"> .hwpx (새 한글 형식)</label>
+    </div>
+    <div class="progress" id="progressBox">
+      <div class="bar"><i id="bar"></i></div>
+      <div id="statusText">변환 엔진을 준비하고 있어요…</div>
+    </div>
+    <ul id="list"></ul>
+  </section>
+
+  <details>
+    <summary>무엇이 옮겨지나요?</summary>
+    <ul>
+      <li>글꼴·크기·굵게/기울임/밑줄·색·형광펜·위/아래 첨자, 문단 정렬·들여쓰기·줄 간격·탭</li>
+      <li>표(셀 병합·배경색·테두리·열 너비·행 높이·제목 줄 반복), 그림, 수식(한글 수식으로)</li>
+      <li>각주/미주, 글상자, 번호 목록, 다단, 용지·여백·방향, 쪽 번호, 머리말/꼬리말</li>
+    </ul>
+    <p>Word 와 한글은 글자 배치 계산이 달라서 줄 바뀜 위치나 쪽 수가 조금 다를 수 있습니다.
+      차트는 [차트] 표시로 남고, 예전 형식(.doc)은 Word 에서 .docx 로 저장한 뒤 넣어 주세요.</p>
+  </details>
+  <details>
+    <summary>파일이 정말 안 올라가나요?</summary>
+    <p>네. 이 페이지는 변환 프로그램(파이썬)을 브라우저로 내려받아 사용자의 PC 안에서 실행합니다.
+      선택한 문서는 인터넷으로 전송되지 않습니다. 처음 한 번 변환 엔진(약 20MB)을 내려받는 데 시간이 걸리고,
+      그다음부터는 브라우저에 저장된 것을 씁니다.</p>
+  </details>
+  <details>
+    <summary>Windows 프로그램으로 쓰고 싶어요</summary>
+    <p>끌어다 놓기 창이 있는 Windows 프로그램도 있습니다.
+      <a href="https://github.com/39nhs/word2hwp-converter">GitHub 저장소</a>에서 내려받아
+      <code>워드한글변환기_실행.bat</code> 을 실행하세요. 폴더 통째로 변환, 예전 .doc 변환(LibreOffice 필요)도 됩니다.</p>
+  </details>
+
+  <footer>
+    본 제품은 한글과컴퓨터의 한/글 문서 파일(.hwp) 공개 문서를 참고하여 개발하였습니다.<br>
+    "한글", "한컴", "HWP" 는 (주)한글과컴퓨터의 상표이며, 이 사이트는 (주)한글과컴퓨터와 관련이 없는 개인 프로젝트입니다.<br>
+    코드: <a href="https://github.com/39nhs/word2hwp-converter">github.com/39nhs/word2hwp-converter</a> (MIT) ·
+    사용한 오픈소스: <a href="https://github.com/39nhs/word2hwp-converter/blob/main/THIRD_PARTY_NOTICES.md">목록</a> ·
+    <a href="https://pyodide.org">Pyodide</a>
+  </footer>
+</main>
+
+<script>
+(() => {
+  const drop = document.getElementById("drop");
+  const input = document.getElementById("file");
+  const list = document.getElementById("list");
+  const bar = document.getElementById("bar");
+  const statusText = document.getElementById("statusText");
+  const progressBox = document.getElementById("progressBox");
+  const OK_EXT = /\.(docx|docm|dotx|dotm)$/i;
+  let ready = false, seq = 0;
+  const queue = [], rows = {};
+  let busy = false;
+
+  const worker = new Worker("worker.js");
+  worker.postMessage({ type: "init", coreUrl: new URL("word2hwp_core.py", location.href).href });
+
+  function setStatus(text, pct) {
+    statusText.textContent = text;
+    if (pct != null) bar.style.width = pct + "%";
+  }
+
+  worker.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === "status") setStatus(m.text, m.pct);
+    else if (m.type === "ready") {
+      ready = true; drop.classList.remove("disabled");
+      setStatus("준비됐어요. Word 파일을 넣어 주세요.", 100);
+      setTimeout(() => { progressBox.style.display = "none"; }, 900);
+      pump();
+    } else if (m.type === "done") {
+      const r = rows[m.id];
+      const blob = new Blob([m.data], { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.className = "btn"; a.href = url; a.download = r.outName; a.textContent = "내려받기";
+      r.action.replaceChildren(a);
+      const notes = (m.warnings || []);
+      r.state.className = "state " + (notes.length ? "warn" : "ok");
+      r.state.textContent = notes.length ? `완료 · 참고: ${notes.slice(0, 3).join(" / ")}` : "완료 ✔";
+      a.click();
+      busy = false; pump();
+    } else if (m.type === "failed") {
+      const r = rows[m.id];
+      r.state.className = "state err"; r.state.textContent = "실패: " + m.error;
+      r.action.replaceChildren();
+      busy = false; pump();
+    } else if (m.type === "fatal") {
+      progressBox.style.display = "";
+      setStatus("변환 엔진을 불러오지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요. (" + m.error + ")", 0);
+    }
+  };
+
+  function addFiles(files) {
+    for (const f of files) {
+      const id = "f" + (++seq);
+      const li = document.createElement("li");
+      const left = document.createElement("div");
+      const name = document.createElement("div"); name.className = "name"; name.textContent = f.name;
+      const state = document.createElement("div"); state.className = "state";
+      const action = document.createElement("div");
+      left.append(name, state); li.append(left, action); list.prepend(li);
+      if (!OK_EXT.test(f.name)) {
+        state.className = "state err";
+        state.textContent = /\.doc$/i.test(f.name)
+          ? "예전 형식(.doc)이에요. Word 에서 '다른 이름으로 저장 → Word 문서(.docx)' 후 넣어 주세요."
+          : "Word 파일(.docx)이 아니에요.";
+        continue;
+      }
+      const fmt = document.querySelector('input[name="fmt"]:checked').value;
+      const outName = f.name.replace(/\.[^.]+$/, "") + "." + fmt;
+      rows[id] = { state, action, outName };
+      state.textContent = ready ? "대기 중" : "엔진 준비가 끝나면 변환해요";
+      queue.push({ id, file: f, fmt });
+    }
+    pump();
+  }
+
+  async function pump() {
+    if (!ready || busy || !queue.length) return;
+    busy = true;
+    const job = queue.shift();
+    const r = rows[job.id];
+    r.state.textContent = "변환 중…";
+    const bytes = await job.file.arrayBuffer();
+    worker.postMessage({ type: "convert", id: job.id, name: job.file.name, bytes, fmt: job.fmt }, [bytes]);
+  }
+
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
+  input.addEventListener("change", () => { addFiles(input.files); input.value = ""; });
+  ["dragenter", "dragover"].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(t => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => addFiles(e.dataTransfer.files));
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => { e.preventDefault(); if (e.target !== drop && !drop.contains(e.target)) addFiles(e.dataTransfer.files); });
+})();
+</script>
+</body>
+</html>

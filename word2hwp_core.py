@@ -323,6 +323,15 @@ def _parse_font(data: bytes, offset: int):
     return names, ratio
 
 
+# 자주 쓰는 글꼴의 (winAscent+winDescent)/em 값. 글꼴 파일을 읽을 수 없을 때(웹 브라우저 등) 사용
+KNOWN_LINE_RATIOS = {
+    "맑은 고딕": 1.33, "malgun gothic": 1.33, "바탕": 1.0, "batang": 1.0, "바탕체": 1.0,
+    "굴림": 1.0, "gulim": 1.0, "굴림체": 1.0, "돋움": 1.0, "dotum": 1.0, "돋움체": 1.0,
+    "궁서": 1.0, "gungsuh": 1.0, "나눔고딕": 1.15, "nanumgothic": 1.15,
+    "times new roman": 1.107, "arial": 1.117, "calibri": 1.221, "cambria": 1.172,
+    "consolas": 1.171, "courier new": 1.133, "segoe ui": 1.33, "georgia": 1.136,
+    "verdana": 1.215, "tahoma": 1.207, "hy견고딕": 1.0, "hy헤드라인m": 1.0,
+}
 _FONT_PATHS: dict = {}
 _WIDTH_CACHE: dict = {}
 _PIL_FONTS: dict = {}
@@ -419,7 +428,10 @@ def font_line_ratio(name: str | None) -> float:
         r = _FONT_INDEX.get(name.strip().lower())
         if r:
             return min(max(r, 1.0), 2.0)
-        # 이 PC 에 없는 글꼴: 자주 쓰는 한글 글꼴의 대략값
+        # 이 PC(또는 웹 브라우저)에 없는 글꼴: Windows 글꼴에서 잰 값 / 한컴 화면 대조로 맞춘 값
+        exact = KNOWN_LINE_RATIOS.get(name.strip().lower())
+        if exact:
+            return exact
         for key, val in (("함초롬", 1.4), ("hcr", 1.4), ("맑은", 1.33), ("malgun", 1.33),
                          ("나눔", 1.15), ("nanum", 1.15)):
             if key in name.lower():

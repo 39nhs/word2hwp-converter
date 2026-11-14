@@ -15,6 +15,14 @@ installed on the user's machine from `requirements.txt` and remain under their o
 | Pillow | 13.0.0 | MIT-CMU (HPND) | https://python-pillow.org/ |
 | pywin32 | 312 | PSF | https://github.com/mhammond/pywin32 |
 
+웹 버전 (`index.html`, `worker.js`) 은 페이지를 열 때 아래를 CDN/PyPI 에서 불러옵니다 (저장소에 포함하지 않음):
+
+| 구성요소 | 버전 | 라이선스 | 출처 |
+| --- | --- | --- | --- |
+| Pyodide (브라우저용 파이썬) | 0.27.7 | MPL-2.0 | https://pyodide.org (cdn.jsdelivr.net) |
+| lxml, Pillow (Pyodide 패키지) | Pyodide 0.27.7 포함판 | BSD-3-Clause, MIT-CMU | Pyodide 배포본 |
+| python-hwpx | 6.12.0 | Apache-2.0 | PyPI |
+
 선택 사항 (Optional, not bundled):
 
 - **LibreOffice** (MPL-2.0) — 설치되어 있으면 예전 `.doc` 파일을 `.docx` 로 바꾸는 데 사용합니다.

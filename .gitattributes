@@ -2,3 +2,5 @@
 *.txt text eol=crlf
 *.py text eol=lf
 *.pyw text eol=lf
+*.html text eol=lf
+*.js text eol=lf
