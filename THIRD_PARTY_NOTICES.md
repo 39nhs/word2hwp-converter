@@ -1,10 +1,10 @@
 # Third-party notices / 사용한 외부 구성요소
 
-이 저장소에는 외부 라이브러리의 소스 코드가 들어 있지 않습니다.
-아래 패키지들은 처음 실행할 때 `requirements.txt` 로 사용자의 PC 에 설치되며, 각자의 라이선스를 따릅니다.
+**Windows 프로그램**: 아래 패키지들은 처음 실행할 때 `requirements.txt` 로 사용자의 PC 에 설치되며,
+각자의 라이선스를 따릅니다 (저장소에 포함하지 않음).
 
-This repository does not contain third-party source code. The packages below are
-installed on the user's machine from `requirements.txt` and remain under their own licenses.
+**Windows app**: the packages below are installed on the user's machine from `requirements.txt`
+and remain under their own licenses (not included in this repository).
 
 | 패키지 (Package) | 버전 (tested) | 라이선스 (License) | 프로젝트 (Project) |
 | --- | --- | --- | --- |
@@ -15,13 +15,17 @@ installed on the user's machine from `requirements.txt` and remain under their o
 | Pillow | 13.0.0 | MIT-CMU (HPND) | https://python-pillow.org/ |
 | pywin32 | 312 | PSF | https://github.com/mhammond/pywin32 |
 
-웹 버전 (`index.html`, `worker.js`) 은 페이지를 열 때 아래를 CDN/PyPI 에서 불러옵니다 (저장소에 포함하지 않음):
+웹 버전 (`index.html`, `worker.js`) 은 외부 서버에 의존하지 않도록 아래 구성요소를
+**수정하지 않은 원본 그대로** [`vendor/`](vendor/) 폴더에 함께 배포합니다
+(받은 곳·체크섬 확인·소스 코드 위치는 [`vendor/README.md`](vendor/README.md), 라이선스 원문은 [`vendor/licenses/`](vendor/licenses/)):
 
-| 구성요소 | 버전 | 라이선스 | 출처 |
-| --- | --- | --- | --- |
-| Pyodide (브라우저용 파이썬) | 0.27.7 | MPL-2.0 | https://pyodide.org (cdn.jsdelivr.net) |
-| lxml, Pillow (Pyodide 패키지) | Pyodide 0.27.7 포함판 | BSD-3-Clause, MIT-CMU | Pyodide 배포본 |
-| python-hwpx | 6.12.0 | Apache-2.0 | PyPI |
+| 구성요소 | 버전 | 라이선스 |
+| --- | --- | --- |
+| Pyodide (브라우저용 CPython, Emscripten 포함) | 0.27.7 | MPL-2.0 |
+| CPython 표준 라이브러리 | 3.12.7 | PSF |
+| lxml (Pyodide 빌드) | 5.2.1 | BSD-3-Clause |
+| Pillow (Pyodide 빌드) | 10.2.0 | MIT-CMU (HPND) |
+| python-hwpx | 6.12.0 | Apache-2.0 (NOTICE 포함) |
 
 선택 사항 (Optional, not bundled):
 

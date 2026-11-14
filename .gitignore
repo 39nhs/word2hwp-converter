@@ -6,3 +6,4 @@ __pycache__/
 *.doc
 *.zip
 _test/
+!vendor/pyodide/python_stdlib.zip

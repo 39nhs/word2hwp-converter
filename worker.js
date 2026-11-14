@@ -1,6 +1,8 @@
 // 브라우저 안에서 파이썬(Pyodide)으로 word2hwp_core.py 를 실행하는 작업자.
 // 파일은 서버로 보내지 않고 이 브라우저 안에서만 변환한다.
-const PYODIDE = "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/";
+// 필요한 엔진 파일은 모두 이 사이트의 vendor/ 폴더에서 받는다 (외부 서버에 의존하지 않음).
+const PYODIDE = new URL("vendor/pyodide/", self.location.href).href;
+const HWPX_WHEEL = new URL("vendor/python_hwpx-6.12.0-py3-none-any.whl", self.location.href).href;
 importScripts(PYODIDE + "pyodide.js");
 
 let py = null;
@@ -11,10 +13,9 @@ async function init(coreUrl) {
   post("status", { text: "변환 엔진 내려받는 중… (처음 한 번만, 10~30초)", pct: 5 });
   py = await loadPyodide({ indexURL: PYODIDE });
   post("status", { text: "문서 처리 도구 준비 중…", pct: 35 });
-  await py.loadPackage(["micropip", "lxml", "Pillow"]);
-  post("status", { text: "한글 파일 라이브러리 설치 중…", pct: 65 });
-  const micropip = py.pyimport("micropip");
-  await micropip.install("python-hwpx==6.12.0");
+  await py.loadPackage(["lxml", "Pillow"]);
+  post("status", { text: "한글 파일 라이브러리 준비 중…", pct: 65 });
+  await py.loadPackage(HWPX_WHEEL);
   post("status", { text: "변환기 불러오는 중…", pct: 90 });
   const code = await (await fetch(coreUrl, { cache: "no-cache" })).text();
   py.FS.mkdirTree("/app"); py.FS.mkdirTree("/work");
